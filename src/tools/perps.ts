@@ -114,8 +114,9 @@ export function checkCollateral(params: {
   const isLong = side === "long";
   const decimals = COLLATERAL_DECIMALS[side][asset];
   const unit = isLong ? asset : "USDC";
+  const article = asset === "ETH" ? "an" : "a";
   const oneUnit = "1" + "0".repeat(decimals);
-  const correctUnit = `${unit} collateral for a ${asset} ${side} uses ${decimals} decimals (1 ${unit} = ${oneUnit})`;
+  const correctUnit = `${unit} collateral for ${article} ${asset} ${side} uses ${decimals} decimals (1 ${unit} = ${oneUnit})`;
 
   if (typeof collateralAmount !== "string" || !/^\d+$/.test(collateralAmount) || Number(collateralAmount) === 0) {
     throw new Error(
@@ -151,6 +152,76 @@ export function checkCollateral(params: {
   return { collateralTokens, collateralUsd, leverage, decimals };
 }
 
+export function describeError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  try {
+    const j = JSON.stringify(err);
+    return j === undefined ? String(err as any) : j;
+  } catch {
+    return String(err as any);
+  }
+}
+
+export async function sendAndConfirm(
+  connection: {
+    sendRawTransaction(raw: Uint8Array | Buffer, opts?: any): Promise<string>;
+    confirmTransaction(strategy: any, commitment?: any): Promise<{ value: { err: unknown } }>;
+  },
+  tx: { serialize(): Uint8Array },
+  blockhash: string,
+  lastValidBlockHeight: number
+): Promise<string> {
+  let signature: string;
+  try {
+    signature = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false });
+  } catch (e) {
+    throw new Error(`Transaction was NOT sent: ${describeError(e)}. Nothing changed on-chain.`);
+  }
+
+  let result: { value: { err: unknown } };
+  try {
+    result = await connection.confirmTransaction(
+      { signature, blockhash, lastValidBlockHeight },
+      "confirmed"
+    );
+  } catch (e) {
+    throw new Error(
+      `Transaction ${signature} was sent but its confirmation was lost: ${describeError(e)}. ` +
+        `It may still land. Do NOT retry yet — check get_perp_positions and get_position_request_status ` +
+        `(or https://solscan.io/tx/${signature}) first.`
+    );
+  }
+  if (result.value.err) {
+    throw new Error(
+      `Transaction ${signature} landed but FAILED on-chain: ${describeError(result.value.err)}. Nothing changed.`
+    );
+  }
+  return signature;
+}
+
+export function classifyRequestOutcome(p: {
+  requestExists: boolean;
+  requestExecuted: boolean;
+  baselineSizeUsd: number;
+  currentSizeUsd: number;
+  change: "increase" | "decrease";
+}): "pending" | "filled" | "not_filled" {
+  if (p.requestExists && !p.requestExecuted) return "pending";
+  if (p.change === "increase") {
+    return p.currentSizeUsd > p.baselineSizeUsd ? "filled" : "not_filled";
+  }
+  return p.currentSizeUsd < p.baselineSizeUsd ? "filled" : "not_filled";
+}
+
+async function readPositionSizeUsd(positionPda: PublicKey): Promise<number> {
+  const acc = await fetchPosition(positionPda);
+  if (!acc) return 0;
+  return bnToUsd((acc as any).sizeUsd as BN);
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 async function executeOpenPosition(params: {
   asset: "SOL" | "ETH" | "BTC";
   side: "long" | "short";
@@ -163,6 +234,7 @@ async function executeOpenPosition(params: {
   txSignature: string;
   collateralUsd: number;
   leverage: number;
+  baselineSizeUsd: number;
 }> {
   const { asset, side, sizeUsd, collateralAmount, priceSlippage } = params;
   const slippage = priceSlippage ?? 500;
@@ -243,6 +315,9 @@ async function executeOpenPosition(params: {
 
   instructions.push(increaseIx);
 
+  // Record the position size before sending so a fill can be detected afterwards.
+  const baselineSizeUsd = await readPositionSizeUsd(positionPda);
+
   const connection = new Connection(process.env.HELIUS_RPC_URL!);
   const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
 
@@ -255,16 +330,9 @@ async function executeOpenPosition(params: {
   const tx = new VersionedTransaction(message);
   tx.sign([keypair]);
 
-  const txSignature = await connection.sendRawTransaction(tx.serialize(), {
-    skipPreflight: false,
-  });
+  const txSignature = await sendAndConfirm(connection, tx, blockhash, lastValidBlockHeight);
 
-  await connection.confirmTransaction(
-    { signature: txSignature, blockhash, lastValidBlockHeight },
-    "confirmed"
-  );
-
-  return { positionPda, positionRequestPda, txSignature, collateralUsd, leverage };
+  return { positionPda, positionRequestPda, txSignature, collateralUsd, leverage, baselineSizeUsd };
 }
 
 export function registerPerpsTools(server: McpServer): void {
@@ -345,7 +413,7 @@ export function registerPerpsTools(server: McpServer): void {
           content: [{ type: "text" as const, text: lines.join("\n\n") }],
         };
       } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeError(err);
         return {
           content: [{ type: "text" as const, text: `Error fetching perp positions: ${msg}` }],
         };
@@ -382,14 +450,13 @@ export function registerPerpsTools(server: McpServer): void {
           });
 
         const result =
-          `Position opened successfully.\n\n` +
+          `Position request submitted (NOT yet filled).\n\n` +
           `Position PDA:         ${positionPda.toString()}\n` +
           `Position Request PDA: ${positionRequestPda.toString()}\n` +
           `Transaction:          ${txSignature}\n` +
           `Solscan:              https://solscan.io/tx/${txSignature}\n\n` +
-          `The request has been submitted to the keeper network for execution. ` +
-          `Call get_position_request_status with positionRequestPda "${positionRequestPda.toString()}" ` +
-          `to confirm keeper execution and see the final fill price.\n` +
+          `The keeper will fill or reject it, usually within seconds. ` +
+          `Call get_position_request_status, then get_perp_positions to confirm the position actually grew — do not assume it filled.\n` +
           `Collateral value: $${collateralUsd.toFixed(2)}\n` +
           `Leverage: ${leverage.toFixed(2)}x`;
 
@@ -397,7 +464,7 @@ export function registerPerpsTools(server: McpServer): void {
           content: [{ type: "text" as const, text: result }],
         };
       } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeError(err);
         return {
           content: [{ type: "text" as const, text: `Error opening perp position: ${msg}` }],
         };
@@ -423,14 +490,16 @@ export function registerPerpsTools(server: McpServer): void {
         .describe("Price slippage tolerance in basis points. Defaults to 500 (5%)"),
       timeoutSeconds: z
         .number()
+        .min(5)
+        .max(120)
         .optional()
         .describe(
-          "Polling timeout in seconds before giving up and cancelling the request. Defaults to 30."
+          "Polling timeout in seconds (5–120) before giving up and cancelling the request. Defaults to 30."
         ),
     },
     async ({ asset, side, sizeUsd, collateralAmount, priceSlippage, timeoutSeconds }) => {
       try {
-        const { positionPda, positionRequestPda, txSignature, collateralUsd, leverage } =
+        const { positionPda, positionRequestPda, txSignature, collateralUsd, leverage, baselineSizeUsd } =
           await executeOpenPosition({
             asset,
             side,
@@ -443,26 +512,58 @@ export function registerPerpsTools(server: McpServer): void {
         const timeoutMs = timeout * 1000;
         const pollIntervalMs = 2000;
         const startTime = Date.now();
-        let executed = false;
+        let outcome: "pending" | "filled" | "not_filled" = "pending";
+        let currentSizeUsd = baselineSizeUsd;
 
         while (Date.now() - startTime < timeoutMs) {
           const requestAccount = await fetchPositionRequest(positionRequestPda);
-          executed = requestAccount === null || (requestAccount as any).executed === true;
-          if (executed) break;
-          await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+          const requestExists = requestAccount !== null;
+          const requestExecuted = requestExists && (requestAccount as any).executed === true;
+          currentSizeUsd = await readPositionSizeUsd(positionPda);
+          const classify = () =>
+            classifyRequestOutcome({
+              requestExists,
+              requestExecuted,
+              baselineSizeUsd,
+              currentSizeUsd,
+              change: "increase",
+            });
+          outcome = classify();
+
+          if (outcome === "not_filled") {
+            // Settlement may lag the request disappearing — re-read a few times before concluding.
+            for (let i = 0; i < 3 && outcome === "not_filled"; i++) {
+              await sleep(pollIntervalMs);
+              currentSizeUsd = await readPositionSizeUsd(positionPda);
+              outcome = classify();
+            }
+          }
+          if (outcome !== "pending") break;
+          await sleep(pollIntervalMs);
         }
 
-        if (executed) {
+        if (outcome === "filled") {
           const result =
-            `Position opened and executed by the keeper.\n\n` +
+            `Position FILLED: size grew from $${baselineSizeUsd.toFixed(2)} to $${currentSizeUsd.toFixed(2)}.\n\n` +
             `Position PDA:         ${positionPda.toString()}\n` +
             `Position Request PDA: ${positionRequestPda.toString()}\n` +
             `Transaction:          ${txSignature}\n` +
-            `Solscan:              https://solscan.io/tx/${txSignature}\n\n` +
-            `The keeper executed the request within the timeout. Call get_perp_positions to see the ` +
-            `final position state — settlement details such as fill price may still lag slightly.\n` +
+            `Solscan:              https://solscan.io/tx/${txSignature}\n` +
             `Collateral value: $${collateralUsd.toFixed(2)}\n` +
             `Leverage: ${leverage.toFixed(2)}x`;
+
+          return { content: [{ type: "text" as const, text: result }] };
+        }
+
+        if (outcome === "not_filled") {
+          const result =
+            `Request was NOT filled — the keeper rejected or closed it. ` +
+            `Position size is unchanged at $${currentSizeUsd.toFixed(2)}. ` +
+            `Any collateral should be back in the wallet; check balances.\n\n` +
+            `Position PDA:         ${positionPda.toString()}\n` +
+            `Position Request PDA: ${positionRequestPda.toString()}\n` +
+            `Transaction:          ${txSignature}\n` +
+            `Solscan:              https://solscan.io/tx/${txSignature}`;
 
           return { content: [{ type: "text" as const, text: result }] };
         }
@@ -490,14 +591,7 @@ export function registerPerpsTools(server: McpServer): void {
           const tx = new VersionedTransaction(message);
           tx.sign([keypair]);
 
-          const cancelTxSignature = await connection.sendRawTransaction(tx.serialize(), {
-            skipPreflight: false,
-          });
-
-          await connection.confirmTransaction(
-            { signature: cancelTxSignature, blockhash, lastValidBlockHeight },
-            "confirmed"
-          );
+          const cancelTxSignature = await sendAndConfirm(connection, tx, blockhash, lastValidBlockHeight);
 
           const result =
             `Position request timed out after ${timeout}s and was cancelled.\n\n` +
@@ -510,7 +604,7 @@ export function registerPerpsTools(server: McpServer): void {
 
           return { content: [{ type: "text" as const, text: result }] };
         } catch (cancelErr: unknown) {
-          const cancelMsg = cancelErr instanceof Error ? cancelErr.message : String(cancelErr);
+          const cancelMsg = describeError(cancelErr);
           return {
             content: [{
               type: "text" as const,
@@ -523,7 +617,7 @@ export function registerPerpsTools(server: McpServer): void {
           };
         }
       } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeError(err);
         return {
           content: [{ type: "text" as const, text: `Error opening perp position: ${msg}` }],
         };
@@ -546,14 +640,21 @@ export function registerPerpsTools(server: McpServer): void {
         const pda = new PublicKey(positionRequestPda);
         const result = await fetchPositionRequest(pda);
 
-        const executed = result === null || (result as any).executed === true;
-        const text = executed
-          ? "Request executed. Call get_perp_positions to confirm your position state."
-          : "Request still pending. Try again in a few seconds.";
+        let text: string;
+        if (result === null) {
+          text =
+            "Request no longer exists: the keeper either FILLED or REJECTED it — this tool cannot tell which. " +
+            "Call get_perp_positions and compare the position size with before the request. Do not assume it filled.";
+        } else if ((result as any).executed === true) {
+          text =
+            "Request marked executed by the keeper. Call get_perp_positions to confirm the position state.";
+        } else {
+          text = "Request still pending. Try again in a few seconds.";
+        }
 
         return { content: [{ type: "text" as const, text }] };
       } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeError(err);
         return {
           content: [{ type: "text" as const, text: `Error checking position request status: ${msg}` }],
         };
@@ -588,9 +689,13 @@ export function registerPerpsTools(server: McpServer): void {
         const positionRequestPda = derivePositionRequestPda(positionPda, counter, "decrease");
 
         const positionAccount = await fetchPosition(positionPda);
-        if (!positionAccount) {
+        const sizeBefore = positionAccount ? bnToUsd((positionAccount as any).sizeUsd as BN) : 0;
+        if (!positionAccount || sizeBefore <= 0) {
           return {
-            content: [{ type: "text" as const, text: `No open position found for ${asset} ${side}.` }],
+            content: [{
+              type: "text" as const,
+              text: `No open ${asset} ${side} position to close (size is $0). Nothing was sent.`,
+            }],
           };
         }
 
@@ -627,28 +732,21 @@ export function registerPerpsTools(server: McpServer): void {
         const tx = new VersionedTransaction(message);
         tx.sign([keypair]);
 
-        const txSignature = await connection.sendRawTransaction(tx.serialize(), {
-          skipPreflight: false,
-        });
-
-        await connection.confirmTransaction(
-          { signature: txSignature, blockhash, lastValidBlockHeight },
-          "confirmed"
-        );
+        const txSignature = await sendAndConfirm(connection, tx, blockhash, lastValidBlockHeight);
 
         const result =
-          `Close request submitted successfully.\n\n` +
+          `Close request submitted (NOT yet filled).\n` +
+          `Position size before close: $${sizeBefore.toFixed(2)}.\n\n` +
           `Position Request PDA: ${positionRequestPda.toString()}\n` +
           `Transaction:          ${txSignature}\n` +
           `Solscan:              https://solscan.io/tx/${txSignature}\n\n` +
-          `Call get_position_request_status with positionRequestPda "${positionRequestPda.toString()}" ` +
-          `to confirm keeper execution.`;
+          `Call get_position_request_status, then get_perp_positions to confirm the position is gone.`;
 
         return {
           content: [{ type: "text" as const, text: result }],
         };
       } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeError(err);
         return {
           content: [{ type: "text" as const, text: `Error closing perp position: ${msg}` }],
         };
