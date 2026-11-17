@@ -1,0 +1,26 @@
+{
+  "name": "sylvester-solone-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.29.0",
+    "@modelcontextprotocol/sdk": "latest",
+    "@solana/spl-token": "^0.4.15",
+    "@solana/web3.js": "latest",
+    "bs58": "latest",
+    "decimal.js": "^10.6.0",
+    "tweetnacl": "^1.0.3",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.2.0",
+    "@types/node": "latest",
+    "ts-node": "^10.9.2",
+    "typescript": "latest"
+  }
+}
