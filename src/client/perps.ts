@@ -40,8 +40,11 @@ let _program: Program | null = null;
 
 export function getPerpsProgram(): Program {
   if (_program) return _program;
-  const connection = new Connection(process.env.HELIUS_RPC_URL!);
-  const provider = new AnchorProvider(connection, {} as Wallet, {});
+  const connection = new Connection(process.env.HELIUS_RPC_URL!, "confirmed");
+  const provider = new AnchorProvider(connection, {} as Wallet, {
+    commitment: "confirmed",
+    preflightCommitment: "confirmed",
+  });
   setProvider(provider);
   _program = new Program(jupiterPerpetualsIdl as Idl, JUPITER_PERPETUALS_PROGRAM_ID, provider);
   return _program;
@@ -364,57 +367,11 @@ async function getRemainingAccounts(): Promise<Array<{ isSigner: boolean; isWrit
 
     return remainingAccounts;
   } catch (error) {
-    console.error("Failed to fetch pool for remaining accounts:", error);
-    // Return dummy remaining accounts for testing
-    // In production, this should fail or retry
-    const dummyAccounts = [];
-
-    // Add dummy custody accounts for SOL, ETH, BTC, USDC, USDT
-    const dummyCustodies = [
-      CUSTODY_ADDRESSES.SOL,
-      CUSTODY_ADDRESSES.ETH,
-      CUSTODY_ADDRESSES.BTC,
-      CUSTODY_ADDRESSES.USDC,
-      CUSTODY_ADDRESSES.USDT,
-    ];
-
-    for (const custody of dummyCustodies) {
-      dummyAccounts.push({
-        isSigner: false,
-        isWritable: false,
-        pubkey: custody,
-      });
-    }
-
-    // Add dummy dovesAgOracle for each custody
-    for (const custody of dummyCustodies) {
-      const custodyKey = custody.toString();
-      const details = CUSTODY_DETAILS[custodyKey];
-
-      if (details) {
-        dummyAccounts.push({
-          isSigner: false,
-          isWritable: false,
-          pubkey: details.dovesAgOracle,
-        });
-      }
-    }
-
-    // Add dummy pythnetOracle for each custody
-    for (const custody of dummyCustodies) {
-      const custodyKey = custody.toString();
-      const details = CUSTODY_DETAILS[custodyKey];
-
-      if (details) {
-        dummyAccounts.push({
-          isSigner: false,
-          isWritable: false,
-          pubkey: details.pythnetOracle,
-        });
-      }
-    }
-
-    return dummyAccounts;
+    const msg = error instanceof Error ? error.message : String(error);
+    console.error("Failed to fetch pool for remaining accounts:", msg);
+    throw new Error(
+      `Could not read the Jupiter Perps pool account: ${msg}. No transaction was built or sent.`
+    );
   }
 }
 
@@ -427,68 +384,45 @@ export async function buildCancelPositionRequestIx(params: {
 }): Promise<TransactionInstruction> {
   const program = getPerpsProgram();
 
-  // Get custody accounts to determine if the asset is SOL (needs special handling)
-  const { custody } = getCustodyAccounts(params.asset, params.side);
-  const isSOL = params.asset === "SOL";
-
   // Get the position request to find the mint
+  let positionRequest: any;
   try {
-    const positionRequest = await program.account.positionRequest.fetch(params.positionRequestPda) as any;
-
-    // Extract mint from position request
-    const mint = positionRequest.mint as PublicKey;
-    const isSOLMint = mint.equals(CUSTODY_DETAILS[CUSTODY_ADDRESSES.SOL.toString()].mint);
-
-    const positionRequestAta = getAssociatedTokenAddressSync(
-      mint,
-      params.positionRequestPda,
-      true
-    );
-
-    const ownerAta = isSOLMint ? undefined : getAssociatedTokenAddressSync(mint, params.walletPublicKey);
-
-    // Build and return the instruction
-    const ix = await program.methods
-      .closePositionRequest({})
-      .accounts({
-        keeper: null as any,
-        owner: params.walletPublicKey,
-        ownerAta: ownerAta,
-        pool: JLP_POOL_ACCOUNT_PUBKEY,
-        positionRequest: params.positionRequestPda,
-        positionRequestAta: positionRequestAta,
-        position: params.positionPda,
-      })
-      .instruction();
-
-    return ix;
+    positionRequest = await program.account.positionRequest.fetch(params.positionRequestPda);
   } catch (error) {
-    console.error("Failed to fetch position request:", error);
-    // If we can't fetch, we'll need to handle this - for now, assume USDC mint for non-SOL
-    const mint = isSOL ? CUSTODY_DETAILS[custody.toString()].mint : CUSTODY_DETAILS[CUSTODY_ADDRESSES.USDC.toString()].mint;
-
-    const positionRequestAta = getAssociatedTokenAddressSync(
-      mint,
-      params.positionRequestPda,
-      true
+    const msg = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Position request ${params.positionRequestPda.toString()} could not be read: ${msg}. ` +
+        `It may already have been executed, rejected or closed — check get_perp_positions and get_position_request_status. ` +
+        `No cancel transaction was built or sent.`
     );
-
-    const ownerAta = isSOL ? undefined : getAssociatedTokenAddressSync(mint, params.walletPublicKey);
-
-    // Build and return the instruction
-    const ix = await program.methods
-      .closePositionRequest({})
-      .accounts({
-        keeper: null as any,
-        owner: params.walletPublicKey,
-        ownerAta: ownerAta,
-        pool: JLP_POOL_ACCOUNT_PUBKEY,
-        positionRequest: params.positionRequestPda,
-        positionRequestAta: positionRequestAta,
-        position: params.positionPda,
-      })
-      .instruction();
-
-    return ix;
   }
+
+  // Extract mint from position request
+  const mint = positionRequest.mint as PublicKey;
+  const isSOLMint = mint.equals(CUSTODY_DETAILS[CUSTODY_ADDRESSES.SOL.toString()].mint);
+
+  const positionRequestAta = getAssociatedTokenAddressSync(
+    mint,
+    params.positionRequestPda,
+    true
+  );
+
+  // ownerAta is an optional account in the IDL: Anchor 0.29 needs null (not undefined) to omit it.
+  const ownerAta = isSOLMint ? null : getAssociatedTokenAddressSync(mint, params.walletPublicKey);
+
+  // Build and return the instruction
+  const ix = await program.methods
+    .closePositionRequest({})
+    .accounts({
+      keeper: null as any,
+      owner: params.walletPublicKey,
+      ownerAta: ownerAta as any,
+      pool: JLP_POOL_ACCOUNT_PUBKEY,
+      positionRequest: params.positionRequestPda,
+      positionRequestAta: positionRequestAta,
+      position: params.positionPda,
+    })
+    .instruction();
+
+  return ix;
 }
