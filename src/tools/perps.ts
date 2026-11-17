@@ -93,6 +93,64 @@ function calcAcceptablePrice(
   return new BN(Math.round(acceptablePrice * SCALE));
 }
 
+// Decimals of the collateral custody's token.
+// LONG: collateral is the asset itself — SOL (So11111111111111111111111111111111111111112) = 9,
+//   ETH (7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs) = 8, BTC (3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh) = 8.
+// SHORT: collateral is USDC = 6.
+const COLLATERAL_DECIMALS = {
+  long: { SOL: 9, ETH: 8, BTC: 8 },
+  short: { SOL: 6, ETH: 6, BTC: 6 },
+} as const;
+
+export function checkCollateral(params: {
+  asset: "SOL" | "ETH" | "BTC";
+  side: "long" | "short";
+  sizeUsd: number;
+  collateralAmount: string;
+  assetPriceUsd: number;
+  maxLeverage?: number;
+}): { collateralTokens: number; collateralUsd: number; leverage: number; decimals: number } {
+  const { asset, side, sizeUsd, collateralAmount, assetPriceUsd, maxLeverage } = params;
+  const isLong = side === "long";
+  const decimals = COLLATERAL_DECIMALS[side][asset];
+  const unit = isLong ? asset : "USDC";
+  const oneUnit = "1" + "0".repeat(decimals);
+  const correctUnit = `${unit} collateral for a ${asset} ${side} uses ${decimals} decimals (1 ${unit} = ${oneUnit})`;
+
+  if (typeof collateralAmount !== "string" || !/^\d+$/.test(collateralAmount) || Number(collateralAmount) === 0) {
+    throw new Error(
+      `collateralAmount must be a positive integer in base units (digits only, no decimals). ` +
+        `${correctUnit}.`
+    );
+  }
+  if (typeof sizeUsd !== "number" || !Number.isFinite(sizeUsd) || sizeUsd <= 0) {
+    throw new Error("sizeUsd must be a finite number greater than 0.");
+  }
+  if (typeof assetPriceUsd !== "number" || !Number.isFinite(assetPriceUsd) || assetPriceUsd <= 0) {
+    throw new Error("assetPriceUsd must be a finite number greater than 0.");
+  }
+
+  const collateralTokens = Number(collateralAmount) / 10 ** decimals;
+  const collateralUsd = isLong ? collateralTokens * assetPriceUsd : collateralTokens;
+  const leverage = sizeUsd / collateralUsd;
+
+  if (leverage < 0.9) {
+    throw new Error(
+      `Collateral is worth $${collateralUsd.toFixed(2)} but the position size is $${sizeUsd} ` +
+        `(leverage ${leverage.toFixed(2)}x).\n` +
+        `Collateral worth more than the position almost always means a units mistake.\n` +
+        `${correctUnit}.`
+    );
+  }
+  if (typeof maxLeverage === "number" && Number.isFinite(maxLeverage) && maxLeverage > 0 && leverage > maxLeverage) {
+    throw new Error(
+      `Leverage ${leverage.toFixed(2)}x exceeds the configured maximum of ${maxLeverage}x.`
+    );
+  }
+
+  return { collateralTokens, collateralUsd, leverage, decimals };
+}
+
 async function executeOpenPosition(params: {
   asset: "SOL" | "ETH" | "BTC";
   side: "long" | "short";
@@ -103,6 +161,8 @@ async function executeOpenPosition(params: {
   positionPda: PublicKey;
   positionRequestPda: PublicKey;
   txSignature: string;
+  collateralUsd: number;
+  leverage: number;
 }> {
   const { asset, side, sizeUsd, collateralAmount, priceSlippage } = params;
   const slippage = priceSlippage ?? 500;
@@ -123,6 +183,17 @@ async function executeOpenPosition(params: {
   type PriceResponse = Record<string, PriceEntry>;
   const priceData = (await jupiterFetch("/price/v3", { ids: mint })) as PriceResponse;
   const currentPrice = priceData[mint].usdPrice;
+
+  // Validate collateral units/value before building or sending anything.
+  const envMaxLev = Number(process.env.MAX_LEVERAGE);
+  const { collateralUsd, leverage } = checkCollateral({
+    asset,
+    side,
+    sizeUsd,
+    collateralAmount,
+    assetPriceUsd: currentPrice,
+    maxLeverage: Number.isFinite(envMaxLev) && envMaxLev > 0 ? envMaxLev : undefined,
+  });
 
   // Opening a long = buying the asset. Opening a short = selling the asset.
   const isBuying = side === "long";
@@ -193,7 +264,7 @@ async function executeOpenPosition(params: {
     "confirmed"
   );
 
-  return { positionPda, positionRequestPda, txSignature };
+  return { positionPda, positionRequestPda, txSignature, collateralUsd, leverage };
 }
 
 export function registerPerpsTools(server: McpServer): void {
@@ -292,7 +363,7 @@ export function registerPerpsTools(server: McpServer): void {
       collateralAmount: z
         .string()
         .describe(
-          "Collateral in token base units: lamports for SOL longs, raw USDC units (6 decimals) for shorts and ETH/BTC longs"
+          "Collateral in base units of the collateral token. LONG: the asset itself — SOL long in lamports (9 decimals, 1 SOL = 1000000000); ETH or BTC long in 8-decimal base units (1 ETH/BTC = 100000000). SHORT (any asset): USDC base units (6 decimals, 1 USDC = 1000000). The tool refuses collateral worth more than the position (a units mistake)."
         ),
       priceSlippage: z
         .number()
@@ -301,13 +372,14 @@ export function registerPerpsTools(server: McpServer): void {
     },
     async ({ asset, side, sizeUsd, collateralAmount, priceSlippage }) => {
       try {
-        const { positionPda, positionRequestPda, txSignature } = await executeOpenPosition({
-          asset,
-          side,
-          sizeUsd,
-          collateralAmount,
-          priceSlippage,
-        });
+        const { positionPda, positionRequestPda, txSignature, collateralUsd, leverage } =
+          await executeOpenPosition({
+            asset,
+            side,
+            sizeUsd,
+            collateralAmount,
+            priceSlippage,
+          });
 
         const result =
           `Position opened successfully.\n\n` +
@@ -317,7 +389,9 @@ export function registerPerpsTools(server: McpServer): void {
           `Solscan:              https://solscan.io/tx/${txSignature}\n\n` +
           `The request has been submitted to the keeper network for execution. ` +
           `Call get_position_request_status with positionRequestPda "${positionRequestPda.toString()}" ` +
-          `to confirm keeper execution and see the final fill price.`;
+          `to confirm keeper execution and see the final fill price.\n` +
+          `Collateral value: $${collateralUsd.toFixed(2)}\n` +
+          `Leverage: ${leverage.toFixed(2)}x`;
 
         return {
           content: [{ type: "text" as const, text: result }],
@@ -341,7 +415,7 @@ export function registerPerpsTools(server: McpServer): void {
       collateralAmount: z
         .string()
         .describe(
-          "Collateral in token base units: lamports for SOL longs, raw USDC units (6 decimals) for shorts and ETH/BTC longs"
+          "Collateral in base units of the collateral token. LONG: the asset itself — SOL long in lamports (9 decimals, 1 SOL = 1000000000); ETH or BTC long in 8-decimal base units (1 ETH/BTC = 100000000). SHORT (any asset): USDC base units (6 decimals, 1 USDC = 1000000). The tool refuses collateral worth more than the position (a units mistake)."
         ),
       priceSlippage: z
         .number()
@@ -356,13 +430,14 @@ export function registerPerpsTools(server: McpServer): void {
     },
     async ({ asset, side, sizeUsd, collateralAmount, priceSlippage, timeoutSeconds }) => {
       try {
-        const { positionPda, positionRequestPda, txSignature } = await executeOpenPosition({
-          asset,
-          side,
-          sizeUsd,
-          collateralAmount,
-          priceSlippage,
-        });
+        const { positionPda, positionRequestPda, txSignature, collateralUsd, leverage } =
+          await executeOpenPosition({
+            asset,
+            side,
+            sizeUsd,
+            collateralAmount,
+            priceSlippage,
+          });
 
         const timeout = timeoutSeconds ?? 30;
         const timeoutMs = timeout * 1000;
@@ -385,7 +460,9 @@ export function registerPerpsTools(server: McpServer): void {
             `Transaction:          ${txSignature}\n` +
             `Solscan:              https://solscan.io/tx/${txSignature}\n\n` +
             `The keeper executed the request within the timeout. Call get_perp_positions to see the ` +
-            `final position state — settlement details such as fill price may still lag slightly.`;
+            `final position state — settlement details such as fill price may still lag slightly.\n` +
+            `Collateral value: $${collateralUsd.toFixed(2)}\n` +
+            `Leverage: ${leverage.toFixed(2)}x`;
 
           return { content: [{ type: "text" as const, text: result }] };
         }
