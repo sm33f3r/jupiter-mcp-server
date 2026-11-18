@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { VersionedTransaction } from "@solana/web3.js";
 import { z } from "zod";
+import bs58 from "bs58";
 import { jupiterFetch } from "../client/jupiter.js";
 import { getSolanaPublicKey, loadSolanaKeypair } from "../client/solana.js";
 
@@ -21,22 +22,45 @@ const ERROR_CODES: Record<number, string> = {
   [-2004]: "RFQ: swap rejected",
 };
 
+export function validateBaseUnits(amount: string): void {
+  if (typeof amount !== "string" || !/^\d+$/.test(amount) || /^0+$/.test(amount)) {
+    throw new Error(
+      `amount must be a positive whole number in base units (digits only, e.g. lamports: 1 SOL = 1000000000). Got: ${amount}. Nothing was submitted.`
+    );
+  }
+}
+
+function describeError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  try {
+    const j = JSON.stringify(err);
+    return j === undefined ? String(err as any) : j;
+  } catch {
+    return String(err as any);
+  }
+}
+
 interface SwapQuoteResponse {
   swapType: string;
   inAmount: string;
   outAmount: string;
   slippageBps: number;
   priceImpactPct: number;
-  routePlan: Array<{
+  routePlan?: Array<{
     label: string;
     [key: string]: unknown;
   }>;
+  errorMessage?: unknown;
+  errorCode?: unknown;
   [key: string]: unknown;
 }
 
 interface OrderResponse {
-  requestId: string;
-  transaction: string | null;
+  requestId?: string;
+  transaction?: string | null;
+  errorMessage?: unknown;
+  errorCode?: unknown;
   [key: string]: unknown;
 }
 
@@ -57,10 +81,12 @@ export function registerSwapTools(server: McpServer): void {
     {
       inputMint: z.string().describe("Mint address of the token to sell"),
       outputMint: z.string().describe("Mint address of the token to buy"),
-      amount: z.string().describe("Amount in base units (smallest denomination) as a decimal string"),
+      amount: z.string().describe("Amount in base units (smallest denomination) as a decimal string. Must be a whole number (digits only)."),
     },
     async ({ inputMint, outputMint, amount }) => {
       try {
+        validateBaseUnits(amount);
+
         // Get the wallet's public key
         const publicKey = getSolanaPublicKey();
         const taker = publicKey.toBase58();
@@ -72,6 +98,13 @@ export function registerSwapTools(server: McpServer): void {
           amount,
           taker,
         })) as SwapQuoteResponse;
+
+        if (quote.errorMessage || quote.errorCode || !Array.isArray(quote.routePlan)) {
+          const reason = quote.errorMessage ?? quote.errorCode ?? "no route";
+          return {
+            content: [{ type: "text", text: `Jupiter returned no quote: ${describeError(reason)}.` }],
+          };
+        }
 
         // Extract route labels
         const routeLabels = quote.routePlan.map(step => step.label).join(" -> ");
@@ -89,7 +122,7 @@ export function registerSwapTools(server: McpServer): void {
           content: [{ type: "text", text: formatted }],
         };
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
+        const errorMessage = describeError(error);
         return {
           content: [{ type: "text", text: `Error getting swap quote: ${errorMessage}` }],
         };
@@ -103,10 +136,13 @@ export function registerSwapTools(server: McpServer): void {
     {
       inputMint: z.string().describe("Mint address of the token to sell"),
       outputMint: z.string().describe("Mint address of the token to buy"),
-      amount: z.string().describe("Amount in base units (smallest denomination) as a decimal string"),
+      amount: z.string().describe("Amount in base units (smallest denomination) as a decimal string. Must be a whole number (digits only)."),
     },
     async ({ inputMint, outputMint, amount }) => {
+      let executeAttempted = false;
       try {
+        validateBaseUnits(amount);
+
         // Get the wallet's public key
         const publicKey = getSolanaPublicKey();
         const taker = publicKey.toBase58();
@@ -119,15 +155,28 @@ export function registerSwapTools(server: McpServer): void {
           taker,
         })) as OrderResponse;
 
+        if (order.errorMessage || order.errorCode || !order.requestId) {
+          const reason = order.errorMessage ?? order.errorCode ?? "no requestId";
+          return {
+            content: [{
+              type: "text",
+              text: `Jupiter did not return an executable order: ${describeError(reason)}. Nothing was submitted.`,
+            }],
+          };
+        }
+
         const requestId = order.requestId;
         let signedTransaction: string | undefined;
+        let localSignature: string | undefined;
 
-        // Branch based on transaction presence
-        if (order.transaction !== null) {
+        // Branch based on transaction presence.
+        // NOTE: the RFQ branch (transaction null, no error field) is unchanged and untested live.
+        if (order.transaction) {
           // Aggregator swap: sign the transaction
           const tx = VersionedTransaction.deserialize(Buffer.from(order.transaction, 'base64'));
           const keypair = loadSolanaKeypair();
           tx.sign([keypair]);
+          localSignature = bs58.encode(tx.signatures[0]);
           signedTransaction = Buffer.from(tx.serialize()).toString('base64');
         }
 
@@ -137,10 +186,23 @@ export function registerSwapTools(server: McpServer): void {
           executeBody.signedTransaction = signedTransaction;
         }
 
-        const executeResult = (await jupiterFetch("/ultra/v1/execute", undefined, {
-          method: 'POST',
-          body: executeBody,
-        })) as ExecuteResponse;
+        let executeResult: ExecuteResponse;
+        executeAttempted = true;
+        try {
+          executeResult = (await jupiterFetch("/ultra/v1/execute", undefined, {
+            method: 'POST',
+            body: executeBody,
+          })) as ExecuteResponse;
+        } catch (execErr) {
+          const lines = [
+            `Swap was submitted to Jupiter but the result was not received: ${describeError(execErr)}. ` +
+              `It may still land. Do NOT retry yet — check wallet balances (get_wallet_balances) first.`,
+            `Request ID: ${requestId}`,
+            localSignature ? `Signature: ${localSignature}` : null,
+            localSignature ? `Explorer: https://solscan.io/tx/${localSignature}` : null,
+          ].filter(line => line !== null);
+          return { content: [{ type: "text", text: lines.join("\n") }] };
+        }
 
         // Format response — status is a string ("Success"/"Failed"), code is the numeric
         // result code that maps to ERROR_CODES. These are two separate fields from Jupiter.
@@ -162,7 +224,7 @@ export function registerSwapTools(server: McpServer): void {
           };
         } else {
           // Failure
-          const signature = executeResult.signature;
+          const signature = executeResult.signature || localSignature;
           const lines = [
             `Swap failed with status ${code}: ${statusMessage}`,
             executeResult.error ? `Error details: ${executeResult.error}` : null,
@@ -175,9 +237,12 @@ export function registerSwapTools(server: McpServer): void {
           };
         }
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
+        const errorMessage = describeError(error);
+        const suffix = executeAttempted || errorMessage.endsWith("Nothing was submitted.")
+          ? ""
+          : " Nothing was submitted.";
         return {
-          content: [{ type: "text", text: `Error executing swap: ${errorMessage}` }],
+          content: [{ type: "text", text: `Error executing swap: ${errorMessage}${suffix}` }],
         };
       }
     }
