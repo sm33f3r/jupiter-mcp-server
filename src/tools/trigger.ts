@@ -1,6 +1,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { VersionedTransaction } from "@solana/web3.js";
 import { z } from "zod";
+import bs58 from "bs58";
+import { validateBaseUnits } from "./swap.js";
 import {
   getTriggerJwt,
   getVaultCached,
@@ -12,6 +14,21 @@ import {
   TRIGGER_API_BASE,
 } from "../client/trigger.js";
 import { getSolanaPublicKey, loadSolanaKeypair } from "../client/solana.js";
+
+function describeError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  try {
+    return JSON.stringify(err) ?? String(err);
+  } catch {
+    return String(err);
+  }
+}
+
+function notSubmitted(err: unknown): string {
+  const msg = describeError(err);
+  return /Nothing was submitted\.$/.test(msg) ? msg : `${msg}. Nothing was submitted.`;
+}
 
 export function registerTriggerTools(server: McpServer): void {
   // Add the new get_trigger_orders tool first
@@ -140,7 +157,7 @@ export function registerTriggerTools(server: McpServer): void {
           content: [{ type: "text", text: output }],
         };
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
+        const errorMessage = describeError(error);
         return {
           content: [{ type: "text", text: `Failed to fetch trigger orders: ${errorMessage}` }],
         };
@@ -156,9 +173,9 @@ export function registerTriggerTools(server: McpServer): void {
       inputMint: z.string().describe("Mint address of the token to sell"),
       outputMint: z.string().describe("Mint address of the token to buy"),
       triggerMint: z.string().describe("Mint address of the token whose USD price triggers the order"),
-      inputAmount: z.string().describe("Amount to sell in base units (lamports for SOL, raw integer for USDC with 6 decimals)"),
+      inputAmount: z.string().describe("Amount to sell in base units (lamports for SOL, raw integer for USDC with 6 decimals). Must be a whole number (digits only)."),
       triggerCondition: z.enum(['above', 'below']).describe("Trigger condition: 'above' = take-profit/buy-into-strength, 'below' = stop-loss/limit-buy"),
-      triggerPriceUsd: z.number().describe("Trigger price in USD"),
+      triggerPriceUsd: z.number().positive().describe("Trigger price in USD"),
       slippageBps: z.number().int().min(0).max(10000).optional().describe("Slippage in basis points (0-10000). Omit to use Jupiter's default"),
       expiresAt: z.number().int().optional().describe("Order expiry as Unix timestamp in milliseconds"),
       expiryDays: z.number().int().min(1).max(365).optional().describe("Order expiry in days (1-365)"),
@@ -175,6 +192,16 @@ export function registerTriggerTools(server: McpServer): void {
       expiryDays,
     }) => {
       try {
+        validateBaseUnits(inputAmount);
+        if (!(Number.isFinite(triggerPriceUsd) && triggerPriceUsd > 0)) {
+          return {
+            content: [{
+              type: "text",
+              text: "Error: triggerPriceUsd must be greater than 0. Nothing was submitted."
+            }]
+          };
+        }
+
         // Pre-API validation
         if (inputMint === outputMint) {
           return {
@@ -233,6 +260,7 @@ export function registerTriggerTools(server: McpServer): void {
         );
         tx.sign([keypair]);
         const depositSignedTx = Buffer.from(tx.serialize()).toString("base64");
+        const depositSig = bs58.encode(tx.signatures[0]);
 
         // Step 5 — Create the order
         // Stop-loss/buy-below orders default to 300 bps to avoid catastrophic fills;
@@ -241,20 +269,35 @@ export function registerTriggerTools(server: McpServer): void {
           ? slippageBps
           : triggerCondition === 'below' ? 300 : undefined;
 
-        const order = await createTriggerOrder({
-          jwt,
-          depositRequestId: deposit.requestId,
-          depositSignedTx,
-          userPubkey: getSolanaPublicKey().toBase58(),
-          inputMint,
-          inputAmount,
-          outputMint,
-          triggerMint,
-          triggerCondition,
-          triggerPriceUsd,
-          slippageBps: resolvedSlippageBps,
-          expiresAt: resolvedExpiresAt,
-        });
+        let order;
+        try {
+          order = await createTriggerOrder({
+            jwt,
+            depositRequestId: deposit.requestId,
+            depositSignedTx,
+            userPubkey: getSolanaPublicKey().toBase58(),
+            inputMint,
+            inputAmount,
+            outputMint,
+            triggerMint,
+            triggerCondition,
+            triggerPriceUsd,
+            slippageBps: resolvedSlippageBps,
+            expiresAt: resolvedExpiresAt,
+          });
+        } catch (submitError) {
+          return {
+            content: [{
+              type: "text",
+              text: [
+                `Order submission was sent but the result was not received: ${describeError(submitError)}. The deposit may have landed and the order may exist. Do NOT retry yet — check get_trigger_orders (state 'active') and get_wallet_balances first.`,
+                `Deposit request ID: ${deposit.requestId}`,
+                `Deposit signature: ${depositSig}`,
+                `Explorer: https://solscan.io/tx/${depositSig}`,
+              ].join("\n"),
+            }],
+          };
+        }
 
         // Format success response
         const expiryDate = new Date(resolvedExpiresAt);
@@ -278,13 +321,11 @@ export function registerTriggerTools(server: McpServer): void {
           content: [{ type: "text", text: lines.join("\n") }],
         };
       } catch (error) {
-        const errorMessage =
-          error instanceof Error ? error.message : String(error);
         return {
           content: [
             {
               type: "text",
-              text: `Failed to create trigger order: ${errorMessage}`,
+              text: `Failed to create trigger order: ${notSubmitted(error)}`,
             },
           ],
         };
@@ -309,7 +350,7 @@ export function registerTriggerTools(server: McpServer): void {
           cancelData = await cancelTriggerOrder({ jwt, orderId });
         } catch (error) {
           // Check for 400 error (order not yet ready_to_cancel)
-          const errorMessage = error instanceof Error ? error.message : String(error);
+          const errorMessage = describeError(error);
           if (errorMessage.includes('400') || errorMessage.includes('not yet ready')) {
             return {
               content: [{
@@ -329,14 +370,30 @@ export function registerTriggerTools(server: McpServer): void {
         );
         tx.sign([keypair]);
         const signedTransaction = Buffer.from(tx.serialize()).toString("base64");
+        const withdrawalSig = bs58.encode(tx.signatures[0]);
 
         // Step 4 — Confirm cancellation
-        const result = await confirmCancelTriggerOrder({
-          jwt,
-          orderId,
-          signedTransaction,
-          cancelRequestId: cancelData.requestId
-        });
+        let result;
+        try {
+          result = await confirmCancelTriggerOrder({
+            jwt,
+            orderId,
+            signedTransaction,
+            cancelRequestId: cancelData.requestId
+          });
+        } catch (submitError) {
+          return {
+            content: [{
+              type: "text",
+              text: [
+                `Cancellation was sent but the result was not received: ${describeError(submitError)}. The withdrawal may still complete. Do NOT retry yet — check get_trigger_orders and get_wallet_balances first.`,
+                `Order ID: ${orderId}`,
+                `Withdrawal signature: ${withdrawalSig}`,
+                `Explorer: https://solscan.io/tx/${withdrawalSig}`,
+              ].join("\n"),
+            }],
+          };
+        }
 
         // Format success response
         const lines = [
@@ -351,7 +408,7 @@ export function registerTriggerTools(server: McpServer): void {
           content: [{ type: "text", text: lines.join("\n") }],
         };
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
+        const errorMessage = describeError(error);
         return {
           content: [{ type: "text", text: `Failed to cancel trigger order: ${errorMessage}` }],
         };
@@ -442,7 +499,7 @@ export function registerTriggerTools(server: McpServer): void {
           content: [{ type: "text", text: lines.join("\n") }],
         };
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
+        const errorMessage = describeError(error);
         return {
           content: [{ type: "text", text: `Failed to update trigger order: ${errorMessage}` }],
         };
@@ -457,7 +514,7 @@ export function registerTriggerTools(server: McpServer): void {
       inputMint: z.string().describe("Mint address of the token to sell"),
       outputMint: z.string().describe("Mint address of the token to buy"),
       triggerMint: z.string().describe("Mint address of the token whose USD price triggers both legs"),
-      inputAmount: z.string().describe("Amount to sell in base units (lamports for SOL, raw integer for USDC with 6 decimals)"),
+      inputAmount: z.string().describe("Amount to sell in base units (lamports for SOL, raw integer for USDC with 6 decimals). Must be a whole number (digits only)."),
       tpPriceUsd: z.number().positive().describe("Take-profit trigger price in USD"),
       slPriceUsd: z.number().positive().describe("Stop-loss trigger price in USD"),
       tpSlippageBps: z.number().int().min(0).max(10000).optional().describe("Take-profit slippage in basis points (0-10000)"),
@@ -478,6 +535,16 @@ export function registerTriggerTools(server: McpServer): void {
       expiryDays,
     }) => {
       try {
+        validateBaseUnits(inputAmount);
+        if (!(Number.isFinite(tpPriceUsd) && tpPriceUsd > 0) || !(Number.isFinite(slPriceUsd) && slPriceUsd > 0)) {
+          return {
+            content: [{
+              type: "text",
+              text: "Error: tpPriceUsd and slPriceUsd must be greater than 0. Nothing was submitted."
+            }]
+          };
+        }
+
         // Pre-API validation
         if (inputMint === outputMint) {
           return {
@@ -545,27 +612,43 @@ export function registerTriggerTools(server: McpServer): void {
         );
         tx.sign([keypair]);
         const depositSignedTx = Buffer.from(tx.serialize()).toString("base64");
+        const depositSig = bs58.encode(tx.signatures[0]);
 
         // Step 5 — Create the OCO order
         // Stop-loss leg defaults to 300 bps to avoid extreme fill prices;
         // take-profit leg passes undefined to use Jupiter's automatic slippage.
         const resolvedSlSlippageBps = slSlippageBps !== undefined ? slSlippageBps : 300;
 
-        const order = await createOcoTriggerOrder({
-          jwt,
-          depositRequestId: deposit.requestId,
-          depositSignedTx,
-          userPubkey: getSolanaPublicKey().toBase58(),
-          inputMint,
-          inputAmount,
-          outputMint,
-          triggerMint,
-          tpPriceUsd,
-          slPriceUsd,
-          tpSlippageBps,
-          slSlippageBps: resolvedSlSlippageBps,
-          expiresAt: resolvedExpiresAt,
-        });
+        let order;
+        try {
+          order = await createOcoTriggerOrder({
+            jwt,
+            depositRequestId: deposit.requestId,
+            depositSignedTx,
+            userPubkey: getSolanaPublicKey().toBase58(),
+            inputMint,
+            inputAmount,
+            outputMint,
+            triggerMint,
+            tpPriceUsd,
+            slPriceUsd,
+            tpSlippageBps,
+            slSlippageBps: resolvedSlSlippageBps,
+            expiresAt: resolvedExpiresAt,
+          });
+        } catch (submitError) {
+          return {
+            content: [{
+              type: "text",
+              text: [
+                `Order submission was sent but the result was not received: ${describeError(submitError)}. The deposit may have landed and the order may exist. Do NOT retry yet — check get_trigger_orders (state 'active') and get_wallet_balances first.`,
+                `Deposit request ID: ${deposit.requestId}`,
+                `Deposit signature: ${depositSig}`,
+                `Explorer: https://solscan.io/tx/${depositSig}`,
+              ].join("\n"),
+            }],
+          };
+        }
 
         // Format success response
         const expiryDate = new Date(resolvedExpiresAt);
@@ -588,9 +671,8 @@ export function registerTriggerTools(server: McpServer): void {
           content: [{ type: "text", text: lines.join("\n") }],
         };
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
         return {
-          content: [{ type: "text", text: `Failed to place OCO order: ${errorMessage}` }],
+          content: [{ type: "text", text: `Failed to place OCO order: ${notSubmitted(error)}` }],
         };
       }
     }
