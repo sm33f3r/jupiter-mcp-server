@@ -222,6 +222,30 @@ async function readPositionSizeUsd(positionPda: PublicKey): Promise<number> {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+function readOptionalPositiveNumber(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+export function resolveOpenSlippageBps(requested: number | undefined, maxBps: number | undefined): number {
+  if (requested === undefined) {
+    return maxBps !== undefined ? Math.min(500, maxBps) : 500;
+  }
+  if (!Number.isInteger(requested) || requested < 0 || requested > 10000) {
+    throw new Error(
+      `priceSlippage must be an integer between 0 and 10000 basis points (got ${requested}). Nothing was sent.`
+    );
+  }
+  if (maxBps !== undefined && requested > maxBps) {
+    throw new Error(
+      `Requested slippage ${requested} bps exceeds MAX_SLIPPAGE_BPS=${maxBps}. Use a lower priceSlippage, or raise or unset MAX_SLIPPAGE_BPS in the server's environment. Nothing was sent.`
+    );
+  }
+  return requested;
+}
+
 async function executeOpenPosition(params: {
   asset: "SOL" | "ETH" | "BTC";
   side: "long" | "short";
@@ -235,9 +259,11 @@ async function executeOpenPosition(params: {
   collateralUsd: number;
   leverage: number;
   baselineSizeUsd: number;
+  slippageBps: number;
 }> {
   const { asset, side, sizeUsd, collateralAmount, priceSlippage } = params;
-  const slippage = priceSlippage ?? 500;
+  // Resolved (and optionally capped) before anything is built or sent.
+  const slippage = resolveOpenSlippageBps(priceSlippage, readOptionalPositiveNumber("MAX_SLIPPAGE_BPS"));
   const keypair = loadSolanaKeypair();
   const counter = new BN(Math.floor(Math.random() * 1_000_000));
 
@@ -257,14 +283,13 @@ async function executeOpenPosition(params: {
   const currentPrice = priceData[mint].usdPrice;
 
   // Validate collateral units/value before building or sending anything.
-  const envMaxLev = Number(process.env.MAX_LEVERAGE);
   const { collateralUsd, leverage } = checkCollateral({
     asset,
     side,
     sizeUsd,
     collateralAmount,
     assetPriceUsd: currentPrice,
-    maxLeverage: Number.isFinite(envMaxLev) && envMaxLev > 0 ? envMaxLev : undefined,
+    maxLeverage: readOptionalPositiveNumber("MAX_LEVERAGE"),
   });
 
   // Opening a long = buying the asset. Opening a short = selling the asset.
@@ -332,7 +357,7 @@ async function executeOpenPosition(params: {
 
   const txSignature = await sendAndConfirm(connection, tx, blockhash, lastValidBlockHeight);
 
-  return { positionPda, positionRequestPda, txSignature, collateralUsd, leverage, baselineSizeUsd };
+  return { positionPda, positionRequestPda, txSignature, collateralUsd, leverage, baselineSizeUsd, slippageBps: slippage };
 }
 
 export function registerPerpsTools(server: McpServer): void {
@@ -435,12 +460,15 @@ export function registerPerpsTools(server: McpServer): void {
         ),
       priceSlippage: z
         .number()
+        .int()
+        .min(0)
+        .max(10000)
         .optional()
-        .describe("Price slippage tolerance in basis points. Defaults to 500 (5%)"),
+        .describe("Price slippage tolerance in basis points (0-10000). Defaults to 500 (5%), or to MAX_SLIPPAGE_BPS if the operator set a lower cap."),
     },
     async ({ asset, side, sizeUsd, collateralAmount, priceSlippage }) => {
       try {
-        const { positionPda, positionRequestPda, txSignature, collateralUsd, leverage } =
+        const { positionPda, positionRequestPda, txSignature, collateralUsd, leverage, slippageBps } =
           await executeOpenPosition({
             asset,
             side,
@@ -458,7 +486,8 @@ export function registerPerpsTools(server: McpServer): void {
           `The keeper will fill or reject it, usually within seconds. ` +
           `Call get_position_request_status, then get_perp_positions to confirm the position actually grew — do not assume it filled.\n` +
           `Collateral value: $${collateralUsd.toFixed(2)}\n` +
-          `Leverage: ${leverage.toFixed(2)}x`;
+          `Leverage: ${leverage.toFixed(2)}x\n` +
+          `Slippage: ${slippageBps} bps`;
 
         return {
           content: [{ type: "text" as const, text: result }],
@@ -486,8 +515,11 @@ export function registerPerpsTools(server: McpServer): void {
         ),
       priceSlippage: z
         .number()
+        .int()
+        .min(0)
+        .max(10000)
         .optional()
-        .describe("Price slippage tolerance in basis points. Defaults to 500 (5%)"),
+        .describe("Price slippage tolerance in basis points (0-10000). Defaults to 500 (5%), or to MAX_SLIPPAGE_BPS if the operator set a lower cap."),
       timeoutSeconds: z
         .number()
         .min(5)
@@ -499,7 +531,7 @@ export function registerPerpsTools(server: McpServer): void {
     },
     async ({ asset, side, sizeUsd, collateralAmount, priceSlippage, timeoutSeconds }) => {
       try {
-        const { positionPda, positionRequestPda, txSignature, collateralUsd, leverage, baselineSizeUsd } =
+        const { positionPda, positionRequestPda, txSignature, collateralUsd, leverage, baselineSizeUsd, slippageBps } =
           await executeOpenPosition({
             asset,
             side,
@@ -550,7 +582,8 @@ export function registerPerpsTools(server: McpServer): void {
             `Transaction:          ${txSignature}\n` +
             `Solscan:              https://solscan.io/tx/${txSignature}\n` +
             `Collateral value: $${collateralUsd.toFixed(2)}\n` +
-            `Leverage: ${leverage.toFixed(2)}x`;
+            `Leverage: ${leverage.toFixed(2)}x\n` +
+            `Slippage: ${slippageBps} bps`;
 
           return { content: [{ type: "text" as const, text: result }] };
         }
@@ -670,11 +703,15 @@ export function registerPerpsTools(server: McpServer): void {
       side: z.enum(["long", "short"]).describe("Direction of the position to close"),
       priceSlippage: z
         .number()
+        .int()
+        .min(0)
+        .max(10000)
         .optional()
-        .describe("Price slippage tolerance in basis points. Defaults to 500 (5%)"),
+        .describe("Price slippage tolerance in basis points (0-10000). Defaults to 500 (5%). Never capped, so an exit is not refused."),
     },
     async ({ asset, side, priceSlippage }) => {
       try {
+        // Closes are intentionally never capped by MAX_SLIPPAGE_BPS.
         const slippage = priceSlippage ?? 500;
         const keypair = loadSolanaKeypair();
         const counter = new BN(Math.floor(Math.random() * 1_000_000));
