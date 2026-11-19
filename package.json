@@ -1,6 +1,25 @@
 {
-  "name": "sylvester-solone-mcp",
-  "version": "0.1.0",
+  "name": "jupiter-mcp-server",
+  "version": "0.2.0",
+  "description": "Self-hosted MCP server for trading on Jupiter (Solana): spot swaps, Trigger V2 limit and OCO orders, and Jupiter Perps via the on-chain program. Signs locally with your own keypair over stdio.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sm33f3r/jupiter-mcp-server.git"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "jupiter",
+    "solana",
+    "defi",
+    "trading",
+    "ai-agents",
+    "perpetuals"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,19 +27,19 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
-    "@coral-xyz/anchor": "^0.29.0",
-    "@modelcontextprotocol/sdk": "latest",
-    "@solana/spl-token": "^0.4.15",
-    "@solana/web3.js": "latest",
-    "bs58": "latest",
-    "decimal.js": "^10.6.0",
-    "tweetnacl": "^1.0.3",
-    "zod": "latest"
+    "@coral-xyz/anchor": "0.29.0",
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@solana/spl-token": "0.4.15",
+    "@solana/web3.js": "1.98.4",
+    "bn.js": "5.2.4",
+    "bs58": "6.0.0",
+    "tweetnacl": "1.0.3",
+    "zod": "4.6.7"
   },
   "devDependencies": {
-    "@types/bn.js": "^5.2.0",
-    "@types/node": "latest",
-    "ts-node": "^10.9.2",
-    "typescript": "latest"
+    "@types/bn.js": "5.2.0",
+    "@types/node": "26.0.0",
+    "ts-node": "10.9.2",
+    "typescript": "6.0.3"
   }
 }
