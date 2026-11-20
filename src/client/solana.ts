@@ -1,4 +1,9 @@
 /**
+ * RPC configuration (read from the environment at call time):
+ *
+ * - SOLANA_RPC_URL: the Solana RPC endpoint. Takes precedence when set and non-empty.
+ * - HELIUS_RPC_URL: legacy fallback, used only when SOLANA_RPC_URL is unset or blank.
+ *
  * Keypair configuration (read from the environment at call time):
  *
  * - SOLANA_KEYPAIR_PATH: path to a file containing the keypair. If set and non-empty it
@@ -15,10 +20,16 @@ import { readFileSync } from "fs";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import bs58 from "bs58";
 
+export function getRpcUrl(): string {
+  const primary = process.env.SOLANA_RPC_URL?.trim();
+  if (primary) return primary;
+  const legacy = process.env.HELIUS_RPC_URL?.trim();
+  if (legacy) return legacy;
+  throw new Error("No Solana RPC URL configured. Set SOLANA_RPC_URL (HELIUS_RPC_URL is also accepted).");
+}
+
 export function getSolanaConnection(): Connection {
-  const heliusRpcUrl = process.env.HELIUS_RPC_URL?.trim();
-  if (!heliusRpcUrl) throw new Error("HELIUS_RPC_URL environment variable is not set");
-  return new Connection(heliusRpcUrl, "confirmed");
+  return new Connection(getRpcUrl(), "confirmed");
 }
 
 export function getSolanaPublicKey(): PublicKey {

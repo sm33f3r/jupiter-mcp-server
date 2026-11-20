@@ -1,12 +1,8 @@
 import { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
 import { Program, AnchorProvider, Wallet, Idl, setProvider } from "@coral-xyz/anchor";
 import BN from "bn.js";
+import { getRpcUrl } from "./solana.js";
 import { jupiterPerpetualsIdl } from "./jupiter-perpetuals-idl.js";
-
-// Validate required environment variable at module load time
-if (!process.env.HELIUS_RPC_URL) {
-  throw new Error("HELIUS_RPC_URL environment variable is required for Jupiter Perps connection");
-}
 
 export const JUPITER_PERPETUALS_PROGRAM_ID = new PublicKey(
   "PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu"
@@ -40,7 +36,7 @@ let _program: Program | null = null;
 
 export function getPerpsProgram(): Program {
   if (_program) return _program;
-  const connection = new Connection(process.env.HELIUS_RPC_URL!, "confirmed");
+  const connection = new Connection(getRpcUrl(), "confirmed");
   const provider = new AnchorProvider(connection, {} as Wallet, {
     commitment: "confirmed",
     preflightCommitment: "confirmed",

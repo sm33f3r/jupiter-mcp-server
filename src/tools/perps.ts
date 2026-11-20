@@ -8,7 +8,7 @@ import {
   VersionedTransaction,
 } from "@solana/web3.js";
 import BN from "bn.js";
-import { loadSolanaKeypair } from "../client/solana.js";
+import { getSolanaConnection, loadSolanaKeypair } from "../client/solana.js";
 import {
   fetchAllPositionsForWallet,
   fetchPosition,
@@ -343,7 +343,7 @@ async function executeOpenPosition(params: {
   // Record the position size before sending so a fill can be detected afterwards.
   const baselineSizeUsd = await readPositionSizeUsd(positionPda);
 
-  const connection = new Connection(process.env.HELIUS_RPC_URL!);
+  const connection = getSolanaConnection();
   const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
 
   const message = new TransactionMessage({
@@ -612,7 +612,7 @@ export function registerPerpsTools(server: McpServer): void {
             side,
           });
 
-          const connection = new Connection(process.env.HELIUS_RPC_URL!);
+          const connection = getSolanaConnection();
           const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
 
           const message = new TransactionMessage({
@@ -757,7 +757,7 @@ export function registerPerpsTools(server: McpServer): void {
           counter,
         });
 
-        const connection = new Connection(process.env.HELIUS_RPC_URL!);
+        const connection = getSolanaConnection();
         const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
 
         const message = new TransactionMessage({
