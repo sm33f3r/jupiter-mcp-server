@@ -9,8 +9,8 @@ import { registerTriggerTools } from "./tools/trigger.js";
 import { registerPerpsTools } from "./tools/perps.js";
 
 const server = new McpServer({
-  name: "sylvester-solone-mcp",
-  version: "0.1.0",
+  name: "jupiter-mcp-server",
+  version: "0.2.0",
 });
 
 server.registerTool(
@@ -27,7 +27,7 @@ server.registerTool(
       content: [
         {
           type: "text",
-          text: `[sylvester-solone-mcp echo] ${message}`,
+          text: `[jupiter-mcp-server echo] ${message}`,
         },
       ],
     };
@@ -47,6 +47,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error("Fatal error running sylvester-solone-mcp server:", error);
+  console.error("Fatal error running jupiter-mcp-server:", error);
   process.exit(1);
 });

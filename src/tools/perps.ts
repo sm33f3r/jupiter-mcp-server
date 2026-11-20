@@ -363,7 +363,7 @@ async function executeOpenPosition(params: {
 export function registerPerpsTools(server: McpServer): void {
   server.tool(
     "get_perp_positions",
-    "Fetch all open Jupiter Perpetuals positions for Sylvester's wallet and return a human-readable summary.",
+    "Fetch all open Jupiter Perpetuals positions for the configured wallet and return a human-readable summary.",
     {},
     async () => {
       try {
@@ -448,7 +448,7 @@ export function registerPerpsTools(server: McpServer): void {
 
   server.tool(
     "open_perp_position",
-    "Open a new Jupiter Perpetuals position for Sylvester's wallet by submitting a market increase position request.",
+    "Open a new Jupiter Perpetuals position for the configured wallet by submitting a market increase position request.",
     {
       asset: z.enum(["SOL", "ETH", "BTC"]).describe("Asset to trade"),
       side: z.enum(["long", "short"]).describe("Position direction"),
@@ -697,7 +697,7 @@ export function registerPerpsTools(server: McpServer): void {
 
   server.tool(
     "close_perp_position",
-    "Close an existing Jupiter Perpetuals position entirely for Sylvester's wallet.",
+    "Close an existing Jupiter Perpetuals position entirely for the configured wallet.",
     {
       asset: z.enum(["SOL", "ETH", "BTC"]).describe("Asset of the position to close"),
       side: z.enum(["long", "short"]).describe("Direction of the position to close"),
